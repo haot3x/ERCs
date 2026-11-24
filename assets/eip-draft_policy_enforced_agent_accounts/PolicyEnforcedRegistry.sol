@@ -8,7 +8,7 @@ interface IERC165 {
 }
 
 /**
- * @title PolicyEnforcedRegistry (v2)
+ * @title PolicyEnforcedRegistry (account-owned stop revision)
  * @notice Reference registry for the draft ERC "Policy-Enforced Agent Accounts". Existing accounts
  *         (for example Safes) opt in by calling `declare` themselves; from then on only the publisher
  *         they named can post their policy commitments. Nobody can write another account's data.
@@ -21,7 +21,8 @@ interface IERC165 {
  *    decides from `effectiveAt`); every signer change after the first waits the current `minDelay`,
  *    except clearing to all zeros, which only removes the claim of enforcement. The account itself
  *    (its owners) may activate a policy at once, as it could change its signers anyway. The emergency
- *    stop only restricts, so the publisher or the account engages it at once.
+ *    stop only restricts, so the publisher or the account engages it at once. Once the account
+ *    asserts a stop, only the account can lift it, including after a publisher rotation.
  */
 contract PolicyEnforcedRegistry is IPolicyEnforcedAccount, IERC165 {
     error NotPublisher();
@@ -33,6 +34,7 @@ contract PolicyEnforcedRegistry is IPolicyEnforcedAccount, IERC165 {
     error TooSoon();
     error NotDue();
     error NoPending();
+    error AccountStopActive();
 
     /// @notice Upper bound on `minDelay`, so an account can never lock its own signers away.
     uint32 public constant MAX_MIN_DELAY = 30 days;
@@ -42,6 +44,7 @@ contract PolicyEnforcedRegistry is IPolicyEnforcedAccount, IERC165 {
     mapping(address account => PolicyCommitment) private _pending;
     mapping(address account => bool) private _hasPending;
     mapping(address account => bool) private _stopped;
+    mapping(address account => bool) private _accountStopped;
     mapping(address account => string) private _mandateURI;
     mapping(address account => bytes32) private _mandateHash;
 
@@ -140,9 +143,14 @@ contract PolicyEnforcedRegistry is IPolicyEnforcedAccount, IERC165 {
         _cancelPending(account, reason);
     }
 
-    /// @notice Engage or lift the emergency stop (publisher or account, both at once).
+    /// @notice Engage the stop at once. A stop asserted by the account is liftable only by the account.
+    /// @dev An account assertion takes ownership even if the publisher already stopped it. Repeating
+    ///      a publisher stop cannot remove that ownership; only an explicit account lift clears it.
     function setStopped(address account, bool stopped, string calldata reason) external onlyPublisherOrAccount(account) {
-        if (_stopped[account] == stopped) return;
+        if (!stopped && _accountStopped[account] && msg.sender != account) revert AccountStopActive();
+        bool takingOwnership = stopped && msg.sender == account && !_accountStopped[account];
+        if (msg.sender == account) _accountStopped[account] = stopped;
+        if (_stopped[account] == stopped && !takingOwnership) return;
         _stopped[account] = stopped;
         if (stopped) emit EmergencyStop(account, reason);
         else emit EmergencyStopLifted(account);

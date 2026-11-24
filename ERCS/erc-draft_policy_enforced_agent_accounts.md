@@ -78,7 +78,7 @@ All reads follow block time: `policySigner` and `signersAt` return a pending sig
 
 ### Discovery
 
-A reader MUST first call `supportsInterface(0x7e0f19f9)` on the account. If it returns true, the account serves the interface itself, and every function is called with the account's own address. Otherwise the reader MUST use a registry implementing the interface and the reader's trust in that registry's address. The reference registry is deployed with the deterministic deployment proxy `0x4e59b44847b379578588920cA78FbF26c0B4956C`, salt `keccak256("policy-enforced-accounts registry v2")`, so that it has the same address on every chain where it is deployed.
+A reader MUST first call `supportsInterface(0x7e0f19f9)` on the account. If it returns true, the account serves the interface itself, and every function is called with the account's own address. Otherwise the reader MUST use a registry implementing the interface and the reader's trust in that registry's address. The existing v2 deployment uses the deterministic deployment proxy `0x4e59b44847b379578588920cA78FbF26c0B4956C` and salt `keccak256("policy-enforced-accounts registry v2")`. It predates the account-owned stop rule below; the updated reference registry requires a new deployment.
 
 ### Registry write rules
 
@@ -93,6 +93,7 @@ A registry:
 - MUST emit `PolicyCancelled` whenever a pending change is removed before it takes effect: replaced, superseded by an activation, or canceled. It MUST NOT allow canceling a pending change after its `effectiveAt`.
 - MUST return a pending change from `policyOf` once its `effectiveAt` has passed, even if nobody has confirmed it, and MUST NOT lose it when a newer change is posted. `pendingPolicyOf` MUST then return `exists = false`.
 - MUST let the publisher or the account engage the emergency stop at once.
+- MUST let only the account lift a stop asserted by the account, including when the account asserts it while already stopped by the publisher. Repeated publisher assertions, signer changes and policy changes MUST NOT remove that restriction. Taking account ownership of an existing stop MUST emit `EmergencyStop`; repeating an assertion without changing the stop or its ownership need not emit another event.
 - SHOULD bound `minDelay` (the reference registry: 30 days), so that an account cannot lock its own signers away.
 - SHOULD have no owner, no upgrade path and hold no funds.
 
@@ -176,7 +177,7 @@ A receipt is evidence of what the enforcer decided, not an authorization to exec
 - **A registry for existing accounts.** Most deployed agent accounts are standard multisigs that cannot add functions. A registry keyed by account, written only by the account (signers) and its publisher (commitments), serves them without upgrades. The account's own `declare` call is what binds a signer to it.
 - **Time rules instead of tightening and loosening.** A registry stores hashes and cannot tell whether a new policy is stricter. A rule based on time has no such gap: whatever the publisher posts waits `minDelay`, in public, with its effective time. An enforcer can still apply a tightening off chain at once, because stricter is always safe; the registry shows it after the delay, and until then receipts carry the newer version, which a use-time verifier refuses (it fails closed). The account itself may activate at once, because its owners could change its signers anyway.
 - **Signer changes wait.** A new publisher could post any policy, so replacing the signers is at least as strong as loosening the policy, and waits the same delay. Clearing is the exception: it only withdraws the claim of enforcement, which can mislead nobody.
-- **The account can stop itself.** The stop only restricts. Letting the account engage it gives a fast answer to a leaked publisher or receipt key while a rotation waits its delay.
+- **The account can stop itself.** The stop only restricts. Letting the account engage it gives a fast answer to a leaked publisher or receipt key while a rotation waits its delay. Requiring the account to lift its own stop prevents the compromised publisher from undoing that recovery step, even if it stopped the account first.
 - **Hash commitments, not on-chain policies.** Policies can be large and private. Committing a hash keeps chain costs constant, keeps private policies private, and still lets anyone holding the document prove which one applied.
 - **The operation is part of the intent.** A call and a delegatecall to the same target with the same data have very different effects. Binding the operation keeps one from standing for the other.
 - **Separate publisher and receipt keys.** The co-signer key that moves funds never needs to sign anything else. A publisher or receipt key that leaks cannot move funds.
@@ -190,14 +191,14 @@ An earlier draft of this ERC (interface `0xcc16d336`, receipt domain version `"1
 
 ## Test Cases
 
-`../assets/eip-draft_policy_enforced_agent_accounts/vectors.json` contains policy documents with their canonical JSON and `policyHash`, intents with their `intentHash` (including the same call as a call and as a delegatecall), and receipts with their EIP-712 digest and signature from a published test-only key. The vectors are checked by an independent TypeScript implementation and by Solidity (`PolicyVectors.t.sol`), and include the RFC 8785 section 3.2.2 example. `PolicyEnforcedRegistry.t.sol` tests each time rule, next to the earlier draft's registry for comparison.
+`../assets/eip-draft_policy_enforced_agent_accounts/vectors.json` contains policy documents with their canonical JSON and `policyHash`, intents with their `intentHash` (including the same call as a call and as a delegatecall), and receipts with their EIP-712 digest and signature from a published test-only key. The vectors are checked by an independent TypeScript implementation and by Solidity (`PolicyVectors.t.sol`), and include the RFC 8785 section 3.2.2 example. `PolicyEnforcedRegistry.t.sol` tests each time rule, next to the earlier draft's registry for comparison, and account-owned stops across repeated assertions, signer and policy changes, clearing and re-declaration, recovery and account isolation.
 
 ## Reference Implementation
 
 In `../assets/eip-draft_policy_enforced_agent_accounts/`:
 
 - `IPolicyEnforcedAccount.sol`: the interface;
-- `PolicyEnforcedRegistry.sol`: the registry, with no owner and no upgrade path, deployed on mainnet chain 4663 at `0xCa3bAE26d29a3A2cED7B87Fa996ca4C44367448d` with verified source;
+- `PolicyEnforcedRegistry.sol`: the registry, with no owner and no upgrade path; the account-owned stop revision is not yet deployed. The existing v2 deployment on chain 4663 at `0xCa3bAE26d29a3A2cED7B87Fa996ca4C44367448d` remains unchanged and does not include this protection;
 - `PolicyDecisionReceipt.sol`: pure helpers to verify a receipt on chain;
 - `PolicyEnforcedRegistry.t.sol`, `PolicyVectors.t.sol`: tests;
 - `v1/`: the earlier draft's contracts, for the comparison tests;

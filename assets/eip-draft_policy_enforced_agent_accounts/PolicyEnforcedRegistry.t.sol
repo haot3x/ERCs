@@ -355,7 +355,11 @@ contract PolicyEnforcedRegistryTest is Test {
         reg.setStopped(account, true, "key leaked");
         assertTrue(reg.isStopped(account));
         vm.prank(publisher);
+        vm.expectRevert(bytes4(keccak256("AccountStopActive()")));
         reg.setStopped(account, false, "");
+        assertTrue(reg.isStopped(account));
+        vm.prank(account);
+        reg.setStopped(account, false, "recovered");
         assertFalse(reg.isStopped(account));
         vm.prank(publisher);
         reg.setStopped(account, true, "paused");
@@ -365,6 +369,148 @@ contract PolicyEnforcedRegistryTest is Test {
         vm.prank(attacker);
         vm.expectRevert(PolicyEnforcedRegistry.NotPublisherOrAccount.selector);
         reg.setStopped(account, true, "x");
+    }
+
+    // Account-owned stop regressions for forum 30467 posts 9/10 (Zealynx / palisec-dev).
+    // Contribution: Ted (@haot3x).
+    function _accountStop() internal {
+        vm.prank(account);
+        reg.setStopped(account, true, "publisher key leaked");
+    }
+
+    function _publisherCannotLift(address who) internal {
+        vm.prank(who);
+        vm.expectRevert(bytes4(keccak256("AccountStopActive()")));
+        reg.setStopped(account, false, "");
+        assertTrue(reg.isStopped(account));
+    }
+
+    function test_accountTakesOverAnExistingPublisherStop() public {
+        vm.prank(publisher);
+        reg.setStopped(account, true, "publisher pause");
+        // An unchanged boolean must still record the account's authority and reason.
+        vm.recordLogs();
+        _accountStop();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1);
+        assertEq(logs[0].emitter, address(reg));
+        assertEq(logs[0].topics[0], IPolicyEnforcedAccount.EmergencyStop.selector);
+        assertEq(logs[0].topics[1], bytes32(uint256(uint160(account))));
+        assertEq(abi.decode(logs[0].data, (string)), "publisher key leaked");
+        _publisherCannotLift(publisher);
+        // Further assertions are idempotent and cannot transfer ownership back.
+        vm.recordLogs();
+        _accountStop();
+        vm.prank(publisher);
+        reg.setStopped(account, true, "publisher pause again");
+        assertEq(vm.getRecordedLogs().length, 0);
+        _publisherCannotLift(publisher);
+    }
+
+    function test_accountStopSurvivesPublisherReassertion() public {
+        _accountStop();
+        vm.prank(publisher);
+        reg.setStopped(account, true, "replace account reason");
+        _publisherCannotLift(publisher);
+    }
+
+    function test_accountStopSurvivesPublisherRotation() public {
+        uint64 at = _now() + DELAY;
+        _accountStop();
+        vm.prank(account);
+        reg.declare(cosigner2, publisher2, receipt, DELAY, 1);
+        vm.warp(at - 1);
+        _publisherCannotLift(publisher);
+        vm.prank(publisher2);
+        vm.expectRevert(PolicyEnforcedRegistry.NotPublisherOrAccount.selector);
+        reg.setStopped(account, false, "not yet publisher");
+        vm.warp(at);
+        _publisherCannotLift(publisher2);
+        vm.prank(publisher);
+        vm.expectRevert(PolicyEnforcedRegistry.NotPublisherOrAccount.selector);
+        reg.setStopped(account, false, "old publisher");
+        vm.expectEmit(true, false, false, true, address(reg));
+        emit IPolicyEnforcedAccount.EmergencyStopLifted(account);
+        vm.prank(account);
+        reg.setStopped(account, false, "rotation complete");
+        assertFalse(reg.isStopped(account));
+    }
+
+    function test_accountStopSurvivesPolicyChanges() public {
+        _accountStop();
+        _publish(H1, 1);
+        assertEq(reg.policyOf(account).version, 1);
+        _publisherCannotLift(publisher);
+        vm.prank(account);
+        reg.activate(account, H2, 2, "", SCHEMA);
+        assertEq(reg.policyOf(account).version, 2);
+        _publisherCannotLift(publisher);
+    }
+
+    function test_accountStopSurvivesClearAndRedeclare() public {
+        _accountStop();
+        vm.prank(account);
+        reg.declare(address(0), address(0), address(0), 0, 0);
+        assertTrue(reg.isStopped(account));
+        vm.prank(publisher);
+        vm.expectRevert(PolicyEnforcedRegistry.NotPublisherOrAccount.selector);
+        reg.setStopped(account, false, "cleared publisher");
+        vm.prank(account);
+        reg.declare(cosigner2, publisher2, receipt, DELAY, 1);
+        _publisherCannotLift(publisher2);
+        vm.prank(account);
+        reg.setStopped(account, false, "explicit recovery");
+        assertFalse(reg.isStopped(account));
+    }
+
+    function test_accountResumeRestoresPublisherStopCycle() public {
+        _accountStop();
+        vm.prank(account);
+        reg.setStopped(account, false, "recovered");
+        vm.startPrank(publisher);
+        reg.setStopped(account, true, "routine pause");
+        assertTrue(reg.isStopped(account));
+        reg.setStopped(account, false, "routine resume");
+        assertFalse(reg.isStopped(account));
+        vm.stopPrank();
+        vm.recordLogs();
+        vm.prank(account);
+        reg.setStopped(account, false, "already resumed");
+        assertEq(vm.getRecordedLogs().length, 0);
+    }
+
+    function test_accountStopIsIsolatedAcrossAccounts() public {
+        vm.prank(other);
+        reg.declare(cosigner, publisher, receipt, DELAY, 1);
+        _accountStop();
+        vm.startPrank(publisher);
+        reg.setStopped(other, true, "unrelated pause");
+        reg.setStopped(other, false, "unrelated resume");
+        vm.stopPrank();
+        assertFalse(reg.isStopped(other));
+        vm.prank(other);
+        vm.expectRevert(PolicyEnforcedRegistry.NotPublisherOrAccount.selector);
+        reg.setStopped(account, false, "wrong account");
+        _publisherCannotLift(publisher);
+    }
+
+    function test_accountCanResumeWhenItIsAlsoPublisher() public {
+        vm.startPrank(other);
+        reg.declare(cosigner, other, receipt, DELAY, 1);
+        reg.setStopped(other, true, "pause");
+        reg.setStopped(other, false, "resume");
+        vm.stopPrank();
+        assertFalse(reg.isStopped(other));
+    }
+
+    function testFuzz_accountStopSurvivesPublisherReassertions(uint8 repeats) public {
+        repeats = uint8(bound(repeats, 0, 32));
+        _accountStop();
+        for (uint256 i; i < repeats; i++) {
+            vm.prank(publisher);
+            reg.setStopped(account, true, "reassert");
+        }
+        _publisherCannotLift(publisher);
     }
 
     function test_accountCannotBeStoppedByTheIncomingPublisherEarly() public {
